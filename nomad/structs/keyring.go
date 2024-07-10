@@ -9,6 +9,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"fmt"
+	"maps"
 	"net/url"
 	"time"
 
@@ -84,6 +85,33 @@ type RootKeyMeta struct {
 	CreateIndex uint64
 	ModifyIndex uint64
 	State       RootKeyState
+
+	// KEKProviders are the external KEK providers the server should use for this
+	// key. If empty, the keyring will default to using only the AEAD provider.
+	KEKProviders []*KEKProvider
+	PublishTime  int64
+}
+
+// KEKProvider is an identifier for an external KMS configuration the server
+// will use as a Key Encryption Key (KEK) for encrypting/decrypting the DEK
+type KEKProvider struct {
+	Provider string
+	Name     string
+}
+
+// KEKProviderConfig is the server configuration for an external KMS provider.
+type KEKProviderConfig struct {
+	Provider string
+	Name     string
+	Config   map[string]string
+}
+
+func (c *KEKProviderConfig) Copy() *KEKProviderConfig {
+	return &KEKProviderConfig{
+		Provider: c.Provider,
+		Name:     c.Name,
+		Config:   maps.Clone(c.Config),
+	}
 }
 
 // RootKeyState enum describes the lifecycle of a root key.
@@ -192,13 +220,16 @@ func (rkm *RootKeyMeta) Validate() error {
 }
 
 // KeyEncryptionKeyWrapper is the struct that gets serialized for the on-disk
-// KMS wrapper. This struct includes the server-specific key-wrapping key and
-// should never be sent over RPC.
+// KMS wrapper. When using the AEAD provider, this struct includes the
+// server-specific key-wrapping key. This struct should never be sent over RPC
+// or written to Raft.
 type KeyEncryptionKeyWrapper struct {
 	Meta                       *RootKeyMeta
 	EncryptedDataEncryptionKey []byte `json:"DEK"`
 	EncryptedRSAKey            []byte `json:"RSAKey"`
-	KeyEncryptionKey           []byte `json:"KEK"`
+	KeyEncryptionKey           []byte `json:"KEK,omitempty"`
+	Provider                   string `json:"provider,omitempty"`
+	ProviderName               string `json:"provider_name,omitempty"`
 }
 
 // EncryptionAlgorithm chooses which algorithm is used for

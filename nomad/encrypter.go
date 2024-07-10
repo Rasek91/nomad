@@ -23,13 +23,17 @@ import (
 	"github.com/go-jose/go-jose/v3/jwt"
 	log "github.com/hashicorp/go-hclog"
 	kms "github.com/hashicorp/go-kms-wrapping/v2"
+	wrapping "github.com/hashicorp/go-kms-wrapping/v2"
 	"github.com/hashicorp/go-kms-wrapping/v2/aead"
-	"golang.org/x/time/rate"
-
+	"github.com/hashicorp/go-kms-wrapping/wrappers/awskms/v2"
+	"github.com/hashicorp/go-kms-wrapping/wrappers/azurekeyvault/v2"
+	"github.com/hashicorp/go-kms-wrapping/wrappers/gcpckms/v2"
+	"github.com/hashicorp/go-kms-wrapping/wrappers/transit/v2"
 	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/crypto"
 	"github.com/hashicorp/nomad/helper/joseutil"
 	"github.com/hashicorp/nomad/nomad/structs"
+	"golang.org/x/time/rate"
 )
 
 const nomadKeystoreExtension = ".nks.json"
@@ -43,8 +47,9 @@ var _ claimSigner = &Encrypter{}
 // Encrypter is the keyring for encrypting variables and signing workload
 // identities.
 type Encrypter struct {
-	srv          *Server
-	keystorePath string
+	srv             *Server
+	providerConfigs map[string]*structs.KEKProviderConfig
+	keystorePath    string
 
 	// issuer is the OIDC Issuer to use for workload identities if configured
 	issuer string
@@ -74,6 +79,9 @@ func NewEncrypter(srv *Server, keystorePath string) (*Encrypter, error) {
 		keystorePath: keystorePath,
 		keyring:      make(map[string]*keyset),
 		issuer:       srv.GetConfig().OIDCIssuer,
+	}
+	for _, provider := range srv.config.KEKProviderConfigs {
+		encrypter.providerConfigs[provider.Provider+provider.Name] = provider
 	}
 
 	err := encrypter.loadKeystore()
@@ -384,47 +392,73 @@ func (e *Encrypter) RemoveKey(keyID string) error {
 	return nil
 }
 
-// saveKeyToStore serializes a root key to the on-disk keystore.
-func (e *Encrypter) saveKeyToStore(rootKey *structs.RootKey) error {
-
-	kek, err := crypto.Bytes(32)
-	if err != nil {
-		return fmt.Errorf("failed to generate key wrapper key: %w", err)
+func (e *Encrypter) encryptDEK(rootKey *structs.RootKey, provider *structs.KEKProvider) (*structs.KeyEncryptionKeyWrapper, error) {
+	if provider == nil {
+		panic("can't encrypt DEK without a provider")
 	}
-	wrapper, err := e.newKMSWrapper(rootKey.Meta.KeyID, kek)
-	if err != nil {
-		return fmt.Errorf("failed to create encryption wrapper: %w", err)
+	var kek []byte
+	var err error
+	if provider.Provider == "aead" || provider.Provider == "" {
+		kek, err = crypto.Bytes(32)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate key wrapper key: %w", err)
+		}
 	}
+	wrapper, err := e.newKMSWrapper(provider.Provider, provider.Name, rootKey.Meta.KeyID, kek)
 	rootBlob, err := wrapper.Encrypt(e.srv.shutdownCtx, rootKey.Key)
 	if err != nil {
-		return fmt.Errorf("failed to encrypt root key: %w", err)
+		return nil, fmt.Errorf("failed to encrypt root key: %w", err)
 	}
-
 	kekWrapper := &structs.KeyEncryptionKeyWrapper{
 		Meta:                       rootKey.Meta,
 		EncryptedDataEncryptionKey: rootBlob.Ciphertext,
 		KeyEncryptionKey:           kek,
+		Provider:                   provider.Provider,
+		ProviderName:               provider.Name,
 	}
 
 	// Only keysets created after 1.7.0 will contain an RSA key.
 	if len(rootKey.RSAKey) > 0 {
 		rsaBlob, err := wrapper.Encrypt(e.srv.shutdownCtx, rootKey.RSAKey)
 		if err != nil {
-			return fmt.Errorf("failed to encrypt rsa key: %w", err)
+			return nil, fmt.Errorf("failed to encrypt rsa key: %w", err)
 		}
 		kekWrapper.EncryptedRSAKey = rsaBlob.Ciphertext
 	}
 
-	buf, err := json.Marshal(kekWrapper)
-	if err != nil {
-		return err
+	return kekWrapper, nil
+}
+
+// saveKeyToStore serializes a root key to the on-disk keystore.
+func (e *Encrypter) saveKeyToStore(rootKey *structs.RootKey) error {
+
+	for _, provider := range rootKey.Meta.KEKProviders {
+		kekWrapper, err := e.encryptDEK(rootKey, provider)
+		if err != nil {
+			return err
+		}
+
+		buf, err := json.Marshal(kekWrapper)
+		if err != nil {
+			return err
+		}
+
+		extension := nomadKeystoreExtension
+		if provider.Provider != "aead" {
+			extension = "." + provider.Provider
+			if provider.Name != "" {
+				extension = extension + "." + provider.Name
+			}
+			extension = extension + nomadKeystoreExtension
+		}
+
+		path := filepath.Join(e.keystorePath, rootKey.Meta.KeyID+extension)
+		err = os.WriteFile(path, buf, 0o600)
+		if err != nil {
+			return err
+		}
 	}
 
-	path := filepath.Join(e.keystorePath, rootKey.Meta.KeyID+nomadKeystoreExtension)
-	err = os.WriteFile(path, buf, 0o600)
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -448,7 +482,9 @@ func (e *Encrypter) loadKeyFromStore(path string) (*structs.RootKey, error) {
 
 	// the errors that bubble up from this library can be a bit opaque, so make
 	// sure we wrap them with as much context as possible
-	wrapper, err := e.newKMSWrapper(meta.KeyID, kekWrapper.KeyEncryptionKey)
+	wrapper, err := e.newKMSWrapper(
+		kekWrapper.Provider, kekWrapper.ProviderName,
+		meta.KeyID, kekWrapper.KeyEncryptionKey)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create key wrapper cipher: %w", err)
 	}
@@ -508,19 +544,40 @@ func (e *Encrypter) GetPublicKey(keyID string) (*structs.KeyringPublicKey, error
 }
 
 // newKMSWrapper returns a go-kms-wrapping interface the caller can use to
-// encrypt the RootKey with a key encryption key (KEK). This is a bit of
-// security theatre for local on-disk key material, but gives us a shim for
-// external KMS providers in the future.
-func (e *Encrypter) newKMSWrapper(keyID string, kek []byte) (kms.Wrapper, error) {
-	wrapper := aead.NewWrapper()
-	wrapper.SetConfig(context.Background(),
-		aead.WithAeadType(kms.AeadTypeAesGcm),
-		aead.WithHashType(kms.HashTypeSha256),
-		kms.WithKeyId(keyID),
-	)
-	err := wrapper.SetAesGcmKeyBytes(kek)
-	if err != nil {
-		return nil, err
+// encrypt the RootKey with a key encryption key (KEK).
+func (e *Encrypter) newKMSWrapper(provider, name string, keyID string, kek []byte) (kms.Wrapper, error) {
+	var wrapper kms.Wrapper
+
+	// TODO: should we bother to add OCI, AliCloud, Tencent, and Huawei?
+	switch provider {
+	case "awskms":
+		wrapper = awskms.NewWrapper()
+	case "azurekeyvault":
+		wrapper = azurekeyvault.NewWrapper()
+	case "gcpckms":
+		wrapper = gcpckms.NewWrapper()
+	case "transit":
+		wrapper = transit.NewWrapper()
+	default: // "aead"
+		wrapper := aead.NewWrapper()
+		wrapper.SetConfig(context.Background(),
+			aead.WithAeadType(kms.AeadTypeAesGcm),
+			aead.WithHashType(kms.HashTypeSha256),
+			kms.WithKeyId(keyID),
+		)
+		err := wrapper.SetAesGcmKeyBytes(kek)
+		if err != nil {
+			return nil, err
+		}
+		return wrapper, nil
+	}
+
+	config, ok := e.providerConfigs[provider+name]
+	if ok {
+		_, err := wrapper.SetConfig(context.Background(), wrapping.WithConfigMap(config.Config))
+		if err != nil {
+			return nil, err
+		}
 	}
 	return wrapper, nil
 }
@@ -595,6 +652,7 @@ func (krr *KeyringReplicator) run(ctx context.Context) {
 					// prevent this case from sending excessive RPCs
 					krr.logger.Error(err.Error(), "key", keyMeta.KeyID)
 				}
+
 			}
 		}
 	}
