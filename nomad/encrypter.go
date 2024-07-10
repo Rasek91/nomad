@@ -11,6 +11,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/go-jose/go-jose/v3"
 	"github.com/go-jose/go-jose/v3/jwt"
+	"github.com/hashicorp/go-hclog"
 	log "github.com/hashicorp/go-hclog"
 	kms "github.com/hashicorp/go-kms-wrapping/v2"
 	wrapping "github.com/hashicorp/go-kms-wrapping/v2"
@@ -48,6 +50,7 @@ var _ claimSigner = &Encrypter{}
 // identities.
 type Encrypter struct {
 	srv             *Server
+	log             hclog.Logger
 	providerConfigs map[string]*structs.KEKProviderConfig
 	keystorePath    string
 
@@ -75,13 +78,21 @@ type keyset struct {
 func NewEncrypter(srv *Server, keystorePath string) (*Encrypter, error) {
 
 	encrypter := &Encrypter{
-		srv:          srv,
-		keystorePath: keystorePath,
-		keyring:      make(map[string]*keyset),
-		issuer:       srv.GetConfig().OIDCIssuer,
+		srv:             srv,
+		log:             srv.logger.With("keyring"),
+		keystorePath:    keystorePath,
+		keyring:         make(map[string]*keyset),
+		issuer:          srv.GetConfig().OIDCIssuer,
+		providerConfigs: map[string]*structs.KEKProviderConfig{},
 	}
 	for _, provider := range srv.config.KEKProviderConfigs {
-		encrypter.providerConfigs[provider.Provider+provider.Name] = provider
+		encrypter.providerConfigs[provider.ID()] = provider
+	}
+	if len(srv.config.KEKProviderConfigs) == 0 {
+		encrypter.providerConfigs["aead"] = &structs.KEKProviderConfig{
+			Provider: "aead",
+			Active:   true,
+		}
 	}
 
 	err := encrypter.loadKeystore()
@@ -97,6 +108,8 @@ func (e *Encrypter) loadKeystore() error {
 		return err
 	}
 
+	keyErrors := map[string]error{}
+
 	return filepath.Walk(e.keystorePath, func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
 			return fmt.Errorf("could not read path %s from keystore: %v", path, err)
@@ -111,13 +124,22 @@ func (e *Encrypter) loadKeystore() error {
 		if !strings.HasSuffix(path, nomadKeystoreExtension) {
 			return nil
 		}
-		id := strings.TrimSuffix(filepath.Base(path), nomadKeystoreExtension)
+		idWithIndex := strings.TrimSuffix(filepath.Base(path), nomadKeystoreExtension)
+		id, _, _ := strings.Cut(idWithIndex, ".")
 		if !helper.IsUUID(id) {
 			return nil
 		}
 
+		e.lock.RLock()
+		_, ok := e.keyring[id]
+		e.lock.RUnlock()
+		if ok {
+			return nil // already loaded this key from another file
+		}
+
 		key, err := e.loadKeyFromStore(path)
 		if err != nil {
+			keyErrors[id] = err
 			return fmt.Errorf("could not load key file %s from keystore: %w", path, err)
 		}
 		if key.Meta.KeyID != id {
@@ -128,6 +150,10 @@ func (e *Encrypter) loadKeystore() error {
 		if err != nil {
 			return fmt.Errorf("could not add key file %s to keystore: %w", path, err)
 		}
+
+		// we loaded this key from at least one KEK configuration, so clear any
+		// error from a previous file that we couldn't read from
+		delete(keyErrors, id)
 		return nil
 	})
 }
@@ -392,7 +418,7 @@ func (e *Encrypter) RemoveKey(keyID string) error {
 	return nil
 }
 
-func (e *Encrypter) encryptDEK(rootKey *structs.RootKey, provider *structs.KEKProvider) (*structs.KeyEncryptionKeyWrapper, error) {
+func (e *Encrypter) encryptDEK(rootKey *structs.RootKey, provider *structs.KEKProviderConfig) (*structs.KeyEncryptionKeyWrapper, error) {
 	if provider == nil {
 		panic("can't encrypt DEK without a provider")
 	}
@@ -404,7 +430,7 @@ func (e *Encrypter) encryptDEK(rootKey *structs.RootKey, provider *structs.KEKPr
 			return nil, fmt.Errorf("failed to generate key wrapper key: %w", err)
 		}
 	}
-	wrapper, err := e.newKMSWrapper(provider.Provider, provider.Name, rootKey.Meta.KeyID, kek)
+	wrapper, err := e.newKMSWrapper(provider, rootKey.Meta.KeyID, kek)
 	rootBlob, err := wrapper.Encrypt(e.srv.shutdownCtx, rootKey.Key)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encrypt root key: %w", err)
@@ -414,7 +440,7 @@ func (e *Encrypter) encryptDEK(rootKey *structs.RootKey, provider *structs.KEKPr
 		EncryptedDataEncryptionKey: rootBlob.Ciphertext,
 		KeyEncryptionKey:           kek,
 		Provider:                   provider.Provider,
-		ProviderName:               provider.Name,
+		ProviderID:                 provider.ID(),
 	}
 
 	// Only keysets created after 1.7.0 will contain an RSA key.
@@ -432,7 +458,10 @@ func (e *Encrypter) encryptDEK(rootKey *structs.RootKey, provider *structs.KEKPr
 // saveKeyToStore serializes a root key to the on-disk keystore.
 func (e *Encrypter) saveKeyToStore(rootKey *structs.RootKey) error {
 
-	for _, provider := range rootKey.Meta.KEKProviders {
+	for _, provider := range e.providerConfigs {
+		if !provider.Active {
+			continue
+		}
 		kekWrapper, err := e.encryptDEK(rootKey, provider)
 		if err != nil {
 			return err
@@ -443,16 +472,8 @@ func (e *Encrypter) saveKeyToStore(rootKey *structs.RootKey) error {
 			return err
 		}
 
-		extension := nomadKeystoreExtension
-		if provider.Provider != "aead" {
-			extension = "." + provider.Provider
-			if provider.Name != "" {
-				extension = extension + "." + provider.Name
-			}
-			extension = extension + nomadKeystoreExtension
-		}
-
-		path := filepath.Join(e.keystorePath, rootKey.Meta.KeyID+extension)
+		filename := fmt.Sprintf("%s.%s%s", rootKey.Meta.KeyID, provider.ID(), nomadKeystoreExtension)
+		path := filepath.Join(e.keystorePath, filename)
 		err = os.WriteFile(path, buf, 0o600)
 		if err != nil {
 			return err
@@ -480,19 +501,22 @@ func (e *Encrypter) loadKeyFromStore(path string) (*structs.RootKey, error) {
 		return nil, err
 	}
 
+	provider, ok := e.providerConfigs[kekWrapper.ProviderID]
+	if !ok {
+		return nil, fmt.Errorf("no such provider %q configured", kekWrapper.ProviderID)
+	}
+
 	// the errors that bubble up from this library can be a bit opaque, so make
 	// sure we wrap them with as much context as possible
-	wrapper, err := e.newKMSWrapper(
-		kekWrapper.Provider, kekWrapper.ProviderName,
-		meta.KeyID, kekWrapper.KeyEncryptionKey)
+	wrapper, err := e.newKMSWrapper(provider, meta.KeyID, kekWrapper.KeyEncryptionKey)
 	if err != nil {
-		return nil, fmt.Errorf("unable to create key wrapper cipher: %w", err)
+		return nil, fmt.Errorf("unable to create key wrapper: %w", err)
 	}
 	key, err := wrapper.Decrypt(e.srv.shutdownCtx, &kms.BlobInfo{
 		Ciphertext: kekWrapper.EncryptedDataEncryptionKey,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("unable to decrypt wrapped root key: %w", err)
+		return nil, fmt.Errorf("%w (root key): %w", ErrDecryptFailed, err)
 	}
 
 	// Decrypt RSAKey for Workload Identity JWT signing if one exists. Prior to
@@ -504,7 +528,7 @@ func (e *Encrypter) loadKeyFromStore(path string) (*structs.RootKey, error) {
 			Ciphertext: kekWrapper.EncryptedRSAKey,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("unable to decrypt wrapped rsa key: %w", err)
+			return nil, fmt.Errorf("%w (rsa key): %w", ErrDecryptFailed, err)
 		}
 	}
 
@@ -514,6 +538,8 @@ func (e *Encrypter) loadKeyFromStore(path string) (*structs.RootKey, error) {
 		RSAKey: rsaKey,
 	}, nil
 }
+
+var ErrDecryptFailed = errors.New("unable to decrypt wrapped key")
 
 // GetPublicKey returns the public signing key for the requested key id or an
 // error if the key could not be found.
@@ -545,11 +571,11 @@ func (e *Encrypter) GetPublicKey(keyID string) (*structs.KeyringPublicKey, error
 
 // newKMSWrapper returns a go-kms-wrapping interface the caller can use to
 // encrypt the RootKey with a key encryption key (KEK).
-func (e *Encrypter) newKMSWrapper(provider, name string, keyID string, kek []byte) (kms.Wrapper, error) {
+func (e *Encrypter) newKMSWrapper(provider *structs.KEKProviderConfig, keyID string, kek []byte) (kms.Wrapper, error) {
 	var wrapper kms.Wrapper
 
 	// TODO: should we bother to add OCI, AliCloud, Tencent, and Huawei?
-	switch provider {
+	switch provider.Provider {
 	case "awskms":
 		wrapper = awskms.NewWrapper()
 	case "azurekeyvault":
@@ -572,7 +598,7 @@ func (e *Encrypter) newKMSWrapper(provider, name string, keyID string, kek []byt
 		return wrapper, nil
 	}
 
-	config, ok := e.providerConfigs[provider+name]
+	config, ok := e.providerConfigs[provider.ID()]
 	if ok {
 		_, err := wrapper.SetConfig(context.Background(), wrapping.WithConfigMap(config.Config))
 		if err != nil {

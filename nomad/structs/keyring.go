@@ -85,33 +85,44 @@ type RootKeyMeta struct {
 	CreateIndex uint64
 	ModifyIndex uint64
 	State       RootKeyState
-
-	// KEKProviders are the external KEK providers the server should use for this
-	// key. If empty, the keyring will default to using only the AEAD provider.
-	KEKProviders []*KEKProvider
-	PublishTime  int64
+	PublishTime int64
 }
 
-// KEKProvider is an identifier for an external KMS configuration the server
-// will use as a Key Encryption Key (KEK) for encrypting/decrypting the DEK
-type KEKProvider struct {
-	Provider string
-	Name     string
-}
-
-// KEKProviderConfig is the server configuration for an external KMS provider.
+// KEKProviderConfig is the server configuration for an external KMS provider
+// the server will use as a Key Encryption Key (KEK) for encrypting/decrypting
+// the DEK.
 type KEKProviderConfig struct {
 	Provider string
 	Name     string
+	Active   bool
 	Config   map[string]string
 }
 
 func (c *KEKProviderConfig) Copy() *KEKProviderConfig {
 	return &KEKProviderConfig{
 		Provider: c.Provider,
+		Active:   c.Active,
 		Name:     c.Name,
 		Config:   maps.Clone(c.Config),
 	}
+}
+
+// Merge is used to merge two configurations. Note that Provider and Name should
+// always be identical before we merge.
+func (c *KEKProviderConfig) Merge(o *KEKProviderConfig) *KEKProviderConfig {
+	result := c.Copy()
+	result.Active = o.Active
+	for k, v := range o.Config {
+		result.Config[k] = v
+	}
+	return result
+}
+
+func (c *KEKProviderConfig) ID() string {
+	if c.Name == "" {
+		return c.Provider
+	}
+	return c.Provider + "." + c.Name
 }
 
 // RootKeyState enum describes the lifecycle of a root key.
@@ -229,7 +240,7 @@ type KeyEncryptionKeyWrapper struct {
 	EncryptedRSAKey            []byte `json:"RSAKey"`
 	KeyEncryptionKey           []byte `json:"KEK,omitempty"`
 	Provider                   string `json:"provider,omitempty"`
-	ProviderName               string `json:"provider_name,omitempty"`
+	ProviderID                 string `json:"provider_id,omitempty"`
 }
 
 // EncryptionAlgorithm chooses which algorithm is used for
