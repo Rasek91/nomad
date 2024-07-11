@@ -143,7 +143,7 @@ const (
 	RootKeyStateInactive     RootKeyState = "inactive"
 	RootKeyStateActive                    = "active"
 	RootKeyStateRekeying                  = "rekeying"
-	RootKeyStatePrepublished              = "prepublish"
+	RootKeyStatePrepublished              = "prepublished"
 
 	// RootKeyStateDeprecated is, itself, deprecated and is no longer in
 	// use. For backwards compatibility, any existing keys with this state will

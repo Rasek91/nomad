@@ -99,7 +99,7 @@ func (c *CoreScheduler) forceGC(eval *structs.Evaluation) error {
 	if err := c.expiredACLTokenGC(eval, true); err != nil {
 		return err
 	}
-	if err := c.rootKeyGC(eval); err != nil {
+	if err := c.rootKeyGC(eval, time.Now()); err != nil {
 		return err
 	}
 	// Node GC must occur after the others to ensure the allocations are
@@ -902,17 +902,17 @@ func (c *CoreScheduler) rootKeyRotateOrGC(eval *structs.Evaluation) error {
 	// a rotation will be sent to the leader so our view of state
 	// is no longer valid. we ack this core job and will pick up
 	// the GC work on the next interval
-	wasRotated, err := c.rootKeyRotate(eval)
+	wasRotated, err := c.rootKeyRotate(eval, time.Now())
 	if err != nil {
 		return err
 	}
 	if wasRotated {
 		return nil
 	}
-	return c.rootKeyGC(eval)
+	return c.rootKeyGC(eval, time.Now())
 }
 
-func (c *CoreScheduler) rootKeyGC(eval *structs.Evaluation) error {
+func (c *CoreScheduler) rootKeyGC(eval *structs.Evaluation, now time.Time) error {
 
 	ws := memdb.NewWatchSet()
 	iter, err := c.snap.RootKeyMetas(ws)
@@ -923,8 +923,21 @@ func (c *CoreScheduler) rootKeyGC(eval *structs.Evaluation) error {
 	// the threshold is longer than we can support with the time table, and we
 	// never want to force-GC keys because that will orphan signed Workload
 	// Identities
-	rotationThreshold := time.Now().Add(-1 *
+	rotationThreshold := now.Add(-1 *
 		(c.srv.config.RootKeyRotationThreshold + c.srv.config.RootKeyGCThreshold))
+
+	fmt.Printf(`
+checking active key
+  %v rotation_threshold_config
+  %v create_time (ns)           %v
+  %v now (ns)                   %v
+  %v rotationThreshold (ns)     %v
+`,
+		c.srv.config.RootKeyRotationThreshold,
+		//		activeKey.CreateTime, time.Unix(0, activeKey.CreateTime),
+		now.UnixNano(), now,
+		rotationThreshold.UnixNano(), rotationThreshold,
+	)
 
 	for {
 		raw := iter.Next()
@@ -969,7 +982,7 @@ func (c *CoreScheduler) rootKeyGC(eval *structs.Evaluation) error {
 // rootKeyRotate checks if the active key is old enough that we need to kick off
 // a rotation. It prepublishes a key first and only promotes that prepublished
 // key to active once the rotation threshold has expired
-func (c *CoreScheduler) rootKeyRotate(eval *structs.Evaluation) (bool, error) {
+func (c *CoreScheduler) rootKeyRotate(eval *structs.Evaluation, now time.Time) (bool, error) {
 
 	ws := memdb.NewWatchSet()
 	iter, err := c.snap.RootKeyMetas(ws)
@@ -978,8 +991,8 @@ func (c *CoreScheduler) rootKeyRotate(eval *structs.Evaluation) (bool, error) {
 	}
 
 	var (
-		activeKey        *structs.RootKeyMeta
-		prepublishingKey *structs.RootKeyMeta
+		activeKey       *structs.RootKeyMeta
+		prepublishedKey *structs.RootKeyMeta
 	)
 
 	for raw := iter.Next(); raw != nil; raw = iter.Next() {
@@ -988,20 +1001,23 @@ func (c *CoreScheduler) rootKeyRotate(eval *structs.Evaluation) (bool, error) {
 		case structs.RootKeyStateActive:
 			activeKey = key
 		case structs.RootKeyStatePrepublished:
-			prepublishingKey = key
+			prepublishedKey = key
 		}
 	}
 
-	if prepublishingKey != nil {
-		if prepublishingKey.PublishTime < time.Now().UnixNano() {
-			// at this point we have a key in a prepublishing state but it's not
+	if prepublishedKey != nil {
+		c.logger.Trace("checking prepublished key eligibility for promotion",
+			"publish_time_unixnano", prepublishedKey.PublishTime, "now_unixnano", now.UnixNano())
+
+		if prepublishedKey.PublishTime > now.UnixNano() {
+			// at this point we have a key in a prepublished state but it's not
 			// ready to be made active, so we bail out. otherwise we'd kick off
 			// a new rotation every time we process this eval and we're past
 			// internval/2
 			return false, nil
 		}
 
-		rootKey, err := c.srv.encrypter.GetKey(prepublishingKey.KeyID)
+		rootKey, err := c.srv.encrypter.GetKey(prepublishedKey.KeyID)
 		if err != nil {
 			c.logger.Error("prepublished key does not exist in keyring", "error", err)
 			return false, nil
@@ -1030,8 +1046,13 @@ func (c *CoreScheduler) rootKeyRotate(eval *structs.Evaluation) (bool, error) {
 		return false, nil
 	}
 
-	rotationThreshold := time.Now().Add(-1 * c.srv.config.RootKeyRotationThreshold)
-	if activeKey.CreateTime >= rotationThreshold.UnixNano()/2 {
+	// we rotate at half the rotation threshold because we want to prepublish a key
+	rotationThreshold := now.Add(-1 * c.srv.config.RootKeyRotationThreshold / 2)
+
+	c.logger.Trace("checking active key eligibility for rotation",
+		"create_time", activeKey.CreateTime, "threshold", rotationThreshold.UnixNano())
+
+	if activeKey.CreateTime > rotationThreshold.UnixNano() {
 		return false, nil // key is too new
 	}
 
@@ -1089,7 +1110,7 @@ func (c *CoreScheduler) variablesRekey(eval *structs.Evaluation) error {
 
 		rootKey, err := c.srv.encrypter.GetKey(keyMeta.KeyID)
 		if err != nil {
-			return fmt.Errorf("rotated key does not exist in keyring", "error", err)
+			return fmt.Errorf("rotated key does not exist in keyring: %w", err)
 		}
 		rootKey = rootKey.Copy()
 		rootKey.Meta.SetInactive()
@@ -1105,7 +1126,6 @@ func (c *CoreScheduler) variablesRekey(eval *structs.Evaluation) error {
 			c.logger.Error("rekey complete but failed to mark key as inactive", "error", err)
 			return err
 		}
-
 	}
 
 	return nil
