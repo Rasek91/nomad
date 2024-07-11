@@ -76,6 +76,17 @@ func NewRootKey(algorithm EncryptionAlgorithm) (*RootKey, error) {
 	return rootKey, nil
 }
 
+func (k *RootKey) Copy() *RootKey {
+	out := &RootKey{
+		Meta:   k.Meta.Copy(),
+		Key:    make([]byte, len(k.Key)),
+		RSAKey: make([]byte, len(k.RSAKey)),
+	}
+	copy(out.Key, k.Key)
+	copy(out.RSAKey, k.RSAKey)
+	return out
+}
+
 // RootKeyMeta is the metadata used to refer to a RootKey. It is
 // stored in raft.
 type RootKeyMeta struct {
@@ -129,9 +140,10 @@ func (c *KEKProviderConfig) ID() string {
 type RootKeyState string
 
 const (
-	RootKeyStateInactive RootKeyState = "inactive"
-	RootKeyStateActive                = "active"
-	RootKeyStateRekeying              = "rekeying"
+	RootKeyStateInactive     RootKeyState = "inactive"
+	RootKeyStateActive                    = "active"
+	RootKeyStateRekeying                  = "rekeying"
+	RootKeyStatePrepublished              = "prepublish"
 
 	// RootKeyStateDeprecated is, itself, deprecated and is no longer in
 	// use. For backwards compatibility, any existing keys with this state will
@@ -169,6 +181,7 @@ func (rkm *RootKeyMeta) Active() bool {
 
 func (rkm *RootKeyMeta) SetActive() {
 	rkm.State = RootKeyStateActive
+	rkm.PublishTime = 0
 }
 
 // Rekeying indicates that variables encrypted with this key should be
@@ -179,6 +192,15 @@ func (rkm *RootKeyMeta) Rekeying() bool {
 
 func (rkm *RootKeyMeta) SetRekeying() {
 	rkm.State = RootKeyStateRekeying
+}
+
+func (rkm *RootKeyMeta) SetPrepublished(t int64) {
+	rkm.PublishTime = t
+	rkm.State = RootKeyStatePrepublished
+}
+
+func (rkm *RootKeyMeta) Prepublished() bool {
+	return rkm.State == RootKeyStatePrepublished
 }
 
 func (rkm *RootKeyMeta) SetInactive() {
@@ -253,8 +275,9 @@ const (
 
 // KeyringRotateRootKeyRequest is the argument to the Keyring.Rotate RPC
 type KeyringRotateRootKeyRequest struct {
-	Algorithm EncryptionAlgorithm
-	Full      bool
+	Algorithm   EncryptionAlgorithm
+	Full        bool
+	PublishTime int64
 	WriteRequest
 }
 
@@ -303,7 +326,7 @@ type KeyringGetRootKeyResponse struct {
 
 // KeyringUpdateRootKeyMetaRequest is used internally for key
 // replication so that we have a request wrapper for writing the
-// metadata to the FSM without including the key material
+// metadata to the FSM without including the key material.
 type KeyringUpdateRootKeyMetaRequest struct {
 	RootKeyMeta *RootKeyMeta
 	Rekey       bool

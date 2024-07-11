@@ -371,16 +371,16 @@ func (e *Encrypter) addCipher(rootKey *structs.RootKey) error {
 	return nil
 }
 
-// GetKey retrieves the key material by ID from the keyring
-func (e *Encrypter) GetKey(keyID string) ([]byte, []byte, error) {
+// GetKey retrieves the key material by ID from the keyring.
+func (e *Encrypter) GetKey(keyID string) (*structs.RootKey, error) {
 	e.lock.RLock()
 	defer e.lock.RUnlock()
 
 	keyset, err := e.keysetByIDLocked(keyID)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return keyset.rootKey.Key, keyset.rootKey.RSAKey, nil
+	return keyset.rootKey, nil
 }
 
 // activeKeySetLocked returns the keyset that belongs to the key marked as
@@ -665,7 +665,7 @@ func (krr *KeyringReplicator) run(ctx context.Context) {
 				}
 
 				keyMeta := raw.(*structs.RootKeyMeta)
-				if key, _, err := krr.encrypter.GetKey(keyMeta.KeyID); err == nil && len(key) > 0 {
+				if key, err := krr.encrypter.GetKey(keyMeta.KeyID); err == nil && len(key.Key) > 0 {
 					// the key material is immutable so if we've already got it
 					// we can move on to the next key
 					continue
