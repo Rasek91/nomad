@@ -926,19 +926,6 @@ func (c *CoreScheduler) rootKeyGC(eval *structs.Evaluation, now time.Time) error
 	rotationThreshold := now.Add(-1 *
 		(c.srv.config.RootKeyRotationThreshold + c.srv.config.RootKeyGCThreshold))
 
-	fmt.Printf(`
-checking active key
-  %v rotation_threshold_config
-  %v create_time (ns)           %v
-  %v now (ns)                   %v
-  %v rotationThreshold (ns)     %v
-`,
-		c.srv.config.RootKeyRotationThreshold,
-		//		activeKey.CreateTime, time.Unix(0, activeKey.CreateTime),
-		now.UnixNano(), now,
-		rotationThreshold.UnixNano(), rotationThreshold,
-	)
-
 	for {
 		raw := iter.Next()
 		if raw == nil {
@@ -948,6 +935,21 @@ checking active key
 		if !keyMeta.Inactive() {
 			continue // never GC keys we're still using
 		}
+
+		fmt.Printf(`
+checking key %s (%s)
+  %v rotation_threshold_config
+  %v create_time (ns)           %v
+  %v now (ns)                   %v
+  %v rotationThreshold (ns)     %v
+`,
+			keyMeta.KeyID, keyMeta.State,
+			c.srv.config.RootKeyRotationThreshold,
+			keyMeta.CreateTime, time.Unix(0, keyMeta.CreateTime),
+			now.UnixNano(), now,
+			rotationThreshold.UnixNano(), rotationThreshold,
+		)
+
 		if keyMeta.CreateTime > rotationThreshold.UnixNano() {
 			continue // don't GC keys with potentially live Workload Identities
 		}
