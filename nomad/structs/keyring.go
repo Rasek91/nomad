@@ -245,7 +245,7 @@ func (rkm *RootKeyMeta) Validate() error {
 	}
 	switch rkm.State {
 	case RootKeyStateInactive, RootKeyStateActive,
-		RootKeyStateRekeying, RootKeyStateDeprecated:
+		RootKeyStateRekeying, RootKeyStateDeprecated, RootKeyStatePrepublished:
 	default:
 		return fmt.Errorf("root key state %q is invalid", rkm.State)
 	}

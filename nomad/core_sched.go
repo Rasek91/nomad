@@ -936,19 +936,8 @@ func (c *CoreScheduler) rootKeyGC(eval *structs.Evaluation, now time.Time) error
 			continue // never GC keys we're still using
 		}
 
-		fmt.Printf(`
-checking key %s (%s)
-  %v rotation_threshold_config
-  %v create_time (ns)           %v
-  %v now (ns)                   %v
-  %v rotationThreshold (ns)     %v
-`,
-			keyMeta.KeyID, keyMeta.State,
-			c.srv.config.RootKeyRotationThreshold,
-			keyMeta.CreateTime, time.Unix(0, keyMeta.CreateTime),
-			now.UnixNano(), now,
-			rotationThreshold.UnixNano(), rotationThreshold,
-		)
+		c.logger.Trace("checking inactive key eligibility for gc",
+			"create_time", keyMeta.CreateTime, "threshold", rotationThreshold.UnixNano())
 
 		if keyMeta.CreateTime > rotationThreshold.UnixNano() {
 			continue // don't GC keys with potentially live Workload Identities
@@ -1009,7 +998,7 @@ func (c *CoreScheduler) rootKeyRotate(eval *structs.Evaluation, now time.Time) (
 
 	if prepublishedKey != nil {
 		c.logger.Trace("checking prepublished key eligibility for promotion",
-			"publish_time_unixnano", prepublishedKey.PublishTime, "now_unixnano", now.UnixNano())
+			"publish_time", prepublishedKey.PublishTime, "now", now.UnixNano())
 
 		if prepublishedKey.PublishTime > now.UnixNano() {
 			// at this point we have a key in a prepublished state but it's not
