@@ -992,7 +992,15 @@ func (c *CoreScheduler) rootKeyRotate(eval *structs.Evaluation, now time.Time) (
 		case structs.RootKeyStateActive:
 			activeKey = key
 		case structs.RootKeyStatePrepublished:
-			prepublishedKey = key
+			// multiple keys can be prepublished, so we only want to handle the
+			// very next one
+			if prepublishedKey == nil {
+				prepublishedKey = key
+			} else {
+				if prepublishedKey.PublishTime > key.PublishTime {
+					prepublishedKey = key
+				}
+			}
 		}
 	}
 

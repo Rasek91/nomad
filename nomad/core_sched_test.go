@@ -2663,6 +2663,14 @@ func TestCoreScheduler_RootKeyRotate(t *testing.T) {
 	must.True(t, key1.Prepublished())
 	must.Eq(t, key0.CreateTime+time.Hour.Nanoseconds(), key1.PublishTime)
 
+	// Externally rotate with prepublish to add a second prepublished key
+	resp := &structs.KeyringRotateRootKeyResponse{}
+	must.NoError(t, srv.RPC("Keyring.Rotate", &structs.KeyringRotateRootKeyRequest{
+		PublishTime:  key1.PublishTime + (time.Hour * 24).Nanoseconds(),
+		WriteRequest: structs.WriteRequest{Region: srv.Region()},
+	}, resp))
+	key2 := resp.Key
+
 	// Eval again with time unchanged
 	c.snap, _ = store.Snapshot()
 	rotated, err = c.rootKeyRotate(eval, now)
@@ -2674,7 +2682,7 @@ func TestCoreScheduler_RootKeyRotate(t *testing.T) {
 		switch k.KeyID {
 		case key0.KeyID:
 			must.True(t, k.Active(), must.Sprint("original key should still be active"))
-		case key1.KeyID:
+		case key1.KeyID, key2.KeyID:
 			must.True(t, k.Prepublished(), must.Sprint("new key should be prepublished"))
 		default:
 			t.Fatalf("should not have created any new keys: %#v", k)
@@ -2695,6 +2703,8 @@ func TestCoreScheduler_RootKeyRotate(t *testing.T) {
 			must.True(t, k.Inactive(), must.Sprint("original key should be inactive"))
 		case key1.KeyID:
 			must.True(t, k.Active(), must.Sprint("prepublished key should now be active"))
+		case key2.KeyID:
+			must.True(t, k.Prepublished(), must.Sprint("later prepublished key should still be prepublished"))
 		default:
 			t.Fatalf("should not have created any new keys: %#v", k)
 		}

@@ -40,7 +40,8 @@ Keyring Options:
   -prepublish
     Set a duration for which to prepublish the new key (ex. "1h"). The currently
     active key will be unchanged but the new public key will be available in the
-    JWKS endpoint.
+    JWKS endpoint. Multiple keys can be prepublished and they will be promoted to
+    active in order of publish time, at most once every root_key_gc_interval.
 
   -verbose
     Show full information.
