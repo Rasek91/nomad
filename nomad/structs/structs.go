@@ -11695,11 +11695,12 @@ func (a *Allocation) LastRescheduleFailed() bool {
 // IdentityClaims are the input to a JWT identifying a workload. It
 // should never be serialized to msgpack unsigned.
 type IdentityClaims struct {
-	Namespace    string `json:"nomad_namespace"`
-	JobID        string `json:"nomad_job_id"`
-	AllocationID string `json:"nomad_allocation_id"`
-	TaskName     string `json:"nomad_task,omitempty"`
-	ServiceName  string `json:"nomad_service,omitempty"`
+	NamespacedJobID string `json:"nomad_workload_id"`
+	Namespace       string `json:"nomad_namespace"`
+	JobID           string `json:"nomad_job_id"`
+	AllocationID    string `json:"nomad_allocation_id"`
+	TaskName        string `json:"nomad_task,omitempty"`
+	ServiceName     string `json:"nomad_service,omitempty"`
 
 	ConsulNamespace string `json:"consul_namespace,omitempty"`
 	VaultNamespace  string `json:"vault_namespace,omitempty"`
@@ -11725,9 +11726,10 @@ func NewIdentityClaims(job *Job, alloc *Allocation, wihandle *WIHandle, wid *Wor
 
 	jwtnow := jwt.NewNumericDate(now.UTC())
 	claims := &IdentityClaims{
-		Namespace:    alloc.Namespace,
-		JobID:        alloc.JobID,
-		AllocationID: alloc.ID,
+		NamespacedJobID: alloc.Namespace + "::" + alloc.JobID,
+		Namespace:       alloc.Namespace,
+		JobID:           alloc.JobID,
+		AllocationID:    alloc.ID,
 		Claims: jwt.Claims{
 			NotBefore: jwtnow,
 			IssuedAt:  jwtnow,
