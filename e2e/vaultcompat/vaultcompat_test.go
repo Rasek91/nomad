@@ -239,6 +239,20 @@ func setupVaultJWT(t *testing.T, vc *vaultapi.Client, jwksURL string) {
 	rolePath = fmt.Sprintf("auth/%s/role/nomad-restricted", jwtPath)
 	_, err = logical.Write(rolePath, roleWID([]string{"nomad-restricted"}))
 	must.NoError(t, err)
+
+	entityOut, err := logical.Write("identity/entity", map[string]any{
+		"name":     "default::restricted_jwt",
+		"policies": []string{"nomad-restricted"},
+	})
+	must.NoError(t, err)
+	entityID := entityOut.Data["id"]
+
+	_, err = logical.Write("identity/entity-alias", map[string]any{
+		"name":           "default::restricted_jwt",
+		"canonical_id":   entityID,
+		"mount_accessor": jwtAuthAccessor,
+	})
+	must.NoError(t, err)
 }
 
 func startNomad(t *testing.T, cb func(*testutil.TestServerConfig)) (func(), *nomadapi.Client) {
@@ -317,7 +331,7 @@ func downloadVaultBuild(t *testing.T, b build) {
 }
 
 func getMinimumVersion(t *testing.T) *version.Version {
-	v, err := version.NewVersion("1.11.0")
+	v, err := version.NewVersion("1.15.0")
 	must.NoError(t, err)
 	return v
 }
