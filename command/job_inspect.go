@@ -36,6 +36,9 @@ Inspect Options:
   -version <job version>
     Display the job at the given job version.
 
+  -hcl
+    Output the original HCL submitted with the job.
+
   -json
     Output the job in its JSON format.
 
@@ -53,6 +56,7 @@ func (c *JobInspectCommand) AutocompleteFlags() complete.Flags {
 	return mergeAutocompleteFlags(c.Meta.AutocompleteFlags(FlagSetClient),
 		complete.Flags{
 			"-version": complete.PredictAnything,
+			"-hcl":     complete.PredictNothing,
 			"-json":    complete.PredictNothing,
 			"-t":       complete.PredictAnything,
 		})
@@ -76,11 +80,12 @@ func (c *JobInspectCommand) AutocompleteArgs() complete.Predictor {
 func (c *JobInspectCommand) Name() string { return "job inspect" }
 
 func (c *JobInspectCommand) Run(args []string) int {
-	var json bool
+	var hcl, json bool
 	var tmpl, versionStr string
 
 	flags := c.Meta.FlagSet(c.Name(), FlagSetClient)
 	flags.Usage = func() { c.Ui.Output(c.Help()) }
+	flags.BoolVar(&hcl, "hcl", false, "")
 	flags.BoolVar(&json, "json", false, "")
 	flags.StringVar(&tmpl, "t", "", "")
 	flags.StringVar(&versionStr, "version", "", "")
@@ -139,6 +144,16 @@ func (c *JobInspectCommand) Run(args []string) int {
 		}
 
 		version = &v
+	}
+
+	if hcl {
+		out, err := getJobHCL(client, namespace, jobID, version)
+		if err != nil {
+			c.Ui.Error(fmt.Sprintf("Error inspecting job: %s", err))
+			return 1
+		}
+		c.Ui.Output(out.Source)
+		return 0
 	}
 
 	// Prefix lookup matched a single job
@@ -205,4 +220,22 @@ func getJob(client *api.Client, namespace, jobID string, version *uint64) (*api.
 	}
 
 	return nil, fmt.Errorf("job %q with version %d couldn't be found", jobID, *version)
+}
+
+// getJob retrieves the job optionally at a particular version.
+func getJobHCL(client *api.Client, namespace, jobID string, version *uint64) (*api.JobSubmission, error) {
+	var q *api.QueryOptions
+	if namespace != "" {
+		q = &api.QueryOptions{Namespace: namespace}
+	}
+	v := uint64(0)
+	if version != nil {
+		v = *version
+	}
+	submission, _, err := client.Jobs().Submission(jobID, int(v), q)
+
+	if err != nil {
+		return nil, fmt.Errorf("job %q with version %d couldn't be found", jobID, version)
+	}
+	return submission, err
 }
